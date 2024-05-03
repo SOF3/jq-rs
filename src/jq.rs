@@ -6,13 +6,15 @@
 use crate::errors::{Error, Result};
 use jq_sys::{
     jq_compile, jq_format_error, jq_get_exit_code, jq_halted, jq_init, jq_next, jq_set_error_cb,
-    jq_start, jq_state, jq_teardown, jv, jv_copy, jv_dump_string, jv_free, jv_get_kind,
-    jv_invalid_get_msg, jv_invalid_has_msg, jv_kind_JV_KIND_INVALID, jv_kind_JV_KIND_NUMBER,
-    jv_kind_JV_KIND_STRING, jv_number_value, jv_parser, jv_parser_free, jv_parser_new,
-    jv_parser_next, jv_parser_set_buf, jv_string_value,
+    jq_start, jq_state, jq_teardown, jv, jv_array, jv_array_append, jv_copy, jv_dump_string,
+    jv_free, jv_get_kind, jv_invalid_get_msg, jv_invalid_has_msg, jv_kind_JV_KIND_INVALID,
+    jv_kind_JV_KIND_NUMBER, jv_kind_JV_KIND_STRING, jv_number_value, jv_parser, jv_parser_free,
+    jv_parser_new, jv_parser_next, jv_parser_remaining, jv_parser_set_buf, jv_string_value,
 };
 use std::ffi::{CStr, CString};
+use std::mem::ManuallyDrop;
 use std::os::raw::{c_char, c_void};
+use std::ptr;
 
 pub struct Jq {
     state: *mut jq_state,
@@ -86,8 +88,18 @@ impl Jq {
 
     /// Run the jq program against an input.
     pub fn execute(&mut self, input: CString) -> Result<String> {
-        let mut parser = Parser::new();
+        let parser = Parser::new();
         self.process(parser.parse(input)?)
+    }
+
+    /// Run the jq program against an iterator of inputs that would get slurped.
+    pub fn execute_slurped<Chunk>(
+        &mut self,
+        inputs: impl Iterator<Item = Chunk>,
+        try_into_cstr: impl Fn(&Chunk) -> Result<&CStr>,
+    ) -> Result<String> {
+        let parser = Parser::new();
+        self.process(parser.parse_slurped(inputs, try_into_cstr)?)
     }
 
     /// Unwind the parser and return the rendered result.
@@ -184,6 +196,11 @@ impl JV {
     pub fn invalid_has_msg(&self) -> bool {
         unsafe { jv_invalid_has_msg(jv_copy(self.ptr)) == 1 }
     }
+
+    pub fn into_raw(self) -> jv {
+        let this = ManuallyDrop::new(self);
+        this.ptr
+    }
 }
 
 impl Drop for JV {
@@ -203,12 +220,12 @@ impl Parser {
         }
     }
 
-    pub fn parse(&mut self, input: CString) -> Result<JV> {
+    pub fn parse(self, input: CString) -> Result<JV> {
         // For a single run, we could set this to `1` (aka `true`) but this will
         // break the repeated `JqProgram` usage.
         // It may be worth exposing this to the caller so they can set it for each
         // use case, but for now we'll just "leave it open."
-        let is_last = 0;
+        let is_partial = 0;
 
         // Originally I planned to have a separate "set_buf" method, but it looks like
         // the C api really wants you to set the buffer, then call `jv_parser_next()` in
@@ -220,7 +237,7 @@ impl Parser {
                 self.ptr,
                 input.as_ptr(),
                 input.as_bytes().len() as i32,
-                is_last,
+                is_partial,
             )
         };
 
@@ -238,6 +255,57 @@ impl Parser {
                 ),
             })
         }
+    }
+
+    pub fn parse_slurped<Chunk>(
+        mut self,
+        inputs: impl Iterator<Item = Chunk>,
+        try_into_cstr: impl Fn(&Chunk) -> Result<&CStr>,
+    ) -> Result<JV> {
+        let mut slurped = JV {
+            ptr: unsafe { jv_array() },
+        };
+
+        let mut peekable = inputs.peekable();
+        while let Some(input) = peekable.next() {
+            // The early return will call the destructor of `slurped`, which drops the allocated array jv.
+            // The previous `input` stored under `self.ptr` is also freed whe `self` is dropped.
+            let input = try_into_cstr(&input)?;
+
+            unsafe {
+                jv_parser_set_buf(
+                    self.ptr,
+                    input.as_ptr(),
+                    input.to_bytes().len() as i32,
+                    if peekable.peek().is_some() { 1 } else { 0 },
+                );
+            }
+
+            while self.remaining() != 0 {
+                let value = JV {
+                    ptr: unsafe { jv_parser_next(self.ptr) },
+                };
+                if value.is_valid() {
+                    slurped.ptr = unsafe { jv_array_append(slurped.ptr, value.into_raw()) };
+                } else if unsafe { jv_invalid_has_msg(jv_copy(value.ptr)) } == 1 {
+                    // `self.ptr`, `slurped` and `value` will be independently dropped after this
+                    // return.
+                    return Err(Error::System {
+                        reason: Some(
+                            value
+                                .get_msg()
+                                .unwrap_or_else(|| "JQ: Parser error".to_string()),
+                        ),
+                    });
+                }
+            }
+        }
+
+        Ok(slurped)
+    }
+
+    fn remaining(&mut self) -> i32 {
+        unsafe { jv_parser_remaining(self.ptr) }
     }
 }
 

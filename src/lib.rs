@@ -182,6 +182,15 @@ impl JqProgram {
         let input = CString::new(data)?;
         self.jq.execute(input)
     }
+
+    /// Runs an iterator of json string inputs as a slurped array against a pre-compiled jq program.
+    pub fn run_slurp<'a>(&mut self, inputs: impl IntoIterator<Item = &'a str>) -> Result<String> {
+        self.jq
+            .execute_slurped(inputs.into_iter().map(CString::new), |result| match result {
+                Ok(string) => Ok(&**string),
+                Err(err) => Err(Error::from(err.clone())),
+            })
+    }
 }
 
 /// Compile a jq program then reuse it, running several inputs against it.
