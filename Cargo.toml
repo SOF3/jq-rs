@@ -9,7 +9,7 @@ license = "Apache-2.0/MIT"
 categories = ["api-bindings"]
 keywords = ["json", "jq", "query"]
 readme = "README.md"
-edition = "2018"
+edition = "2021"
 
 [features]
 default = []

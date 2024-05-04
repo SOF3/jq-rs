@@ -5,7 +5,7 @@ fn test_slurp() {
     let mut program = jq_rs::compile(".").unwrap();
 
     let mut outputs = Vec::new();
-    program.run_slurp(Chunks(["123", "45 67", " ", "89 ", "12", " 345"].into_iter().copied().map(str::as_bytes)), |output| outputs.push(output)).unwrap();
+    program.run_slurp(Chunks(["123", "45 67", " ", "89 ", "12", " 345"].into_iter().map(str::as_bytes)), |output| outputs.push(output)).unwrap();
 
     assert_eq!(outputs.len(), 1);
 
