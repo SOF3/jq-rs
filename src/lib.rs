@@ -151,6 +151,8 @@ extern crate serde_json;
 mod errors;
 mod jq;
 
+pub use jq::{Chunks, IntoJv, Jv};
+
 use std::ffi::CString;
 
 pub use errors::{Error, Result};
@@ -171,25 +173,36 @@ pub struct JqProgram {
 }
 
 impl JqProgram {
-    /// Runs a json string input against a pre-compiled jq program.
+    /// Runs a JSON string input against a pre-compiled jq program.
     pub fn run(&mut self, data: &str) -> Result<String> {
-        if data.trim().is_empty() {
-            // During work on #4, #7, the parser test which allows us to avoid a memory
-            // error shows that an empty input just yields an empty response BUT our
-            // implementation would yield a parse error.
-            return Ok("".into());
-        }
-        let input = CString::new(data)?;
-        self.jq.execute(input)
+        let mut outputs = Vec::new();
+        self.run_raw(data, |value| outputs.push(value))?;
+
+        outputs.into_iter().map(|jv| {
+            let mut dump = jv.as_dump_string()?;
+            dump.push('\n');
+            Ok(dump)
+        }).collect()
     }
 
-    /// Runs an iterator of json string inputs as a slurped array against a pre-compiled jq program.
-    pub fn run_slurp<'a>(&mut self, inputs: impl IntoIterator<Item = &'a str>) -> Result<String> {
-        self.jq
-            .execute_slurped(inputs.into_iter().map(CString::new), |result| match result {
-                Ok(string) => Ok(&**string),
-                Err(err) => Err(Error::from(err.clone())),
-            })
+    /// Runs the pre-compiled jq program with the given inputs and collects the results in the
+    /// sink.
+    pub fn run_raw<'a>(
+        &mut self,
+        data: impl IntoJv<'a>,
+        output_sink: impl FnMut(Jv),
+    ) -> Result<()> {
+        self.jq.execute(data, output_sink)
+    }
+
+    /// Slurps the inputs into a JSON array, runs the pre-compiled jq program with the array
+    /// and collects the results in the sink.
+    pub fn run_slurp<'a>(
+        &mut self,
+        inputs: impl IntoJv<'a>,
+        output_sink: impl FnMut(Jv),
+    ) -> Result<()> {
+        self.jq.execute_slurped(inputs, output_sink)
     }
 }
 

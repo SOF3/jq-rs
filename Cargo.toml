@@ -16,6 +16,7 @@ default = []
 bundled = ["jq-sys/bundled"]
 
 [dependencies]
+itertools = "0.12.1"
 jq-sys = "0.2.*"
 
 [dev-dependencies]

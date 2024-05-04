@@ -1,4 +1,5 @@
 use clap::Parser;
+use jq_rs::Chunks;
 
 #[derive(Parser)]
 struct Args {
@@ -17,13 +18,21 @@ fn main() -> jq_rs::Result<()> {
     let mut program = jq_rs::compile(&args.program)?;
 
     if args.slurp {
+        let mut outputs = Vec::new();
         match program.run_slurp(
-            args.inputs
-                .iter()
-                .map(String::as_str)
-                .flat_map(|input| [input, if args.concat { "" } else { "\n" }]),
+            Chunks(
+                args.inputs
+                    .iter()
+                    .map(String::as_bytes)
+                    .flat_map(|input| [input, if args.concat { b"" } else { b"\n" }]),
+            ),
+            |value| outputs.push(value),
         ) {
-            Ok(s) => print!("{}", s), // The output will include a trailing newline
+            Ok(()) => {
+                for item in outputs {
+                    println!("{}", item.as_dump_string().unwrap());
+                }
+            },
             Err(e) => eprintln!("{}", e),
         }
     } else {

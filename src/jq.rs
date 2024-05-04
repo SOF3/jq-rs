@@ -12,13 +12,63 @@ use jq_sys::{
     jv_parser_new, jv_parser_next, jv_parser_remaining, jv_parser_set_buf, jv_string_value,
 };
 use std::ffi::{CStr, CString};
+use std::iter;
+use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::os::raw::{c_char, c_void};
-use std::ptr;
+
+use itertools::{Itertools as _, Position};
 
 pub struct Jq {
     state: *mut jq_state,
     err_buf: String,
+}
+
+/// A type that can be resolved into an iterator of JSON values,
+/// which could serve as the inputs to a JQ program.
+pub trait IntoJv<'a> {
+    /// Instantiates a new iterator of JSON objects.
+    fn into_jv(self) -> impl Iterator<Item = Result<Jv>> + 'a;
+}
+
+impl IntoJv<'static> for Vec<Jv> {
+    fn into_jv(self) -> impl Iterator<Item = Result<Jv>> {
+        self.into_iter().map(Ok)
+    }
+}
+
+impl<'a> IntoJv<'a> for &'a [Jv] {
+    fn into_jv(self) -> impl Iterator<Item = Result<Jv>> + 'a {
+        self.iter().cloned().map(Ok)
+    }
+}
+
+impl<'a> IntoJv<'a> for &'a CStr {
+    fn into_jv(self) -> impl Iterator<Item = Result<Jv>> + 'a {
+        self.to_bytes().into_jv()
+    }
+}
+
+impl<'a> IntoJv<'a> for &'a str {
+    fn into_jv(self) -> impl Iterator<Item = Result<Jv>> + 'a {
+        self.as_bytes().into_jv()
+    }
+}
+
+impl<'a> IntoJv<'a> for &'a [u8] {
+    fn into_jv(self) -> impl Iterator<Item = Result<Jv>> + 'a {
+        Chunks([self]).into_jv()
+    }
+}
+
+/// An adaptor for [`IntoJv`] for discontinuous chunks of bytes.
+pub struct Chunks<I>(pub I);
+
+impl<'a, I: IntoIterator<Item = &'a [u8]> + 'a> IntoJv<'a> for Chunks<I> {
+    fn into_jv(self) -> impl Iterator<Item = Result<Jv>> + 'a {
+        let parser = Parser::new();
+        parser.parse_multi(self.0.into_iter())
+    }
 }
 
 impl Jq {
@@ -69,7 +119,7 @@ impl Jq {
     }
 
     fn get_exit_code(&self) -> ExitCode {
-        let exit_code = JV {
+        let exit_code = Jv {
             ptr: unsafe { jq_get_exit_code(self.state) },
         };
 
@@ -86,28 +136,16 @@ impl Jq {
         }
     }
 
-    /// Run the jq program against an input.
-    pub fn execute(&mut self, input: CString) -> Result<String> {
-        let parser = Parser::new();
-        self.process(parser.parse(input)?)
-    }
-
-    /// Run the jq program against an iterator of inputs that would get slurped.
-    pub fn execute_slurped<Chunk>(
+    /// Run the jq program against the first value in the input.
+    pub fn execute<'a>(
         &mut self,
-        inputs: impl Iterator<Item = Chunk>,
-        try_into_cstr: impl Fn(&Chunk) -> Result<&CStr>,
-    ) -> Result<String> {
-        let parser = Parser::new();
-        self.process(parser.parse_slurped(inputs, try_into_cstr)?)
-    }
-
-    /// Unwind the parser and return the rendered result.
-    ///
-    /// When this results in `Err`, the String value should contain a message about
-    /// what failed.
-    fn process(&mut self, initial_value: JV) -> Result<String> {
-        let mut buf = String::new();
+        input: impl IntoJv<'a>,
+        mut output_sink: impl FnMut(Jv),
+    ) -> Result<()> {
+        let Some(initial_value) = input.into_jv().next() else {
+            return Ok(()); // no input, so no output
+        };
+        let initial_value = initial_value?;
 
         unsafe {
             // `jq_start` seems to be a consuming call.
@@ -118,10 +156,50 @@ impl Jq {
             // it is no longer needed.
             drop(initial_value);
 
-            dump(self, &mut buf)?;
+            while let Some(result) = self.next_result() {
+                let result = result?;
+
+                output_sink(result);
+            }
         }
 
-        Ok(buf)
+        Ok(())
+    }
+
+    /// Run the jq program against an iterator of inputs that would get slurped.
+    pub fn execute_slurped<'a>(
+        &mut self,
+        input: impl IntoJv<'a>,
+        output_sink: impl FnMut(Jv),
+    ) -> Result<()> {
+        let mut slurped = Jv {
+            ptr: unsafe { jv_array() },
+        };
+
+        for item in input.into_jv() {
+            slurped.ptr = unsafe { jv_array_append(slurped.ptr, item?.into_raw()) };
+        }
+
+        self.execute(vec![slurped], output_sink)
+    }
+
+    fn next_result(&mut self) -> Option<Result<Jv>> {
+        let value = Jv {
+            ptr: unsafe { jq_next(self.state) },
+        };
+        if value.is_valid() {
+            Some(Ok(value))
+        } else {
+            if let Err(err) = unsafe { report_jq_err(self, &value) } {
+                return Some(Err(err));
+            }
+
+            value.get_msg().map(|reason| {
+                Err(Error::System {
+                    reason: Some(reason),
+                })
+            })
+        }
     }
 }
 
@@ -131,14 +209,15 @@ impl Drop for Jq {
     }
 }
 
-struct JV {
+/// A handle to a JSON value that can be passed into a JQ program or rendered as a string.
+pub struct Jv {
     ptr: jv,
 }
 
-impl JV {
+impl Jv {
     /// Convert the current `JV` into the "dump string" rendering of itself.
     pub fn as_dump_string(&self) -> Result<String> {
-        let dump = JV {
+        let dump = Jv {
             ptr: unsafe { jv_dump_string(jv_copy(self.ptr), 0) },
         };
         unsafe { get_string_value(jv_string_value(dump.ptr)) }
@@ -148,7 +227,7 @@ impl JV {
     pub fn get_msg(&self) -> Option<String> {
         if self.invalid_has_msg() {
             let reason = {
-                let msg = JV {
+                let msg = Jv {
                     ptr: unsafe {
                         // This call is gross since we're dipping outside of the
                         // safe/drop-enabled wrapper to get a copy which will be freed
@@ -169,6 +248,7 @@ impl JV {
         }
     }
 
+    /// Returns the underlying number if the value is a number.
     pub fn as_number(&self) -> Option<f64> {
         unsafe {
             if jv_get_kind(self.ptr) == jv_kind_JV_KIND_NUMBER {
@@ -179,6 +259,7 @@ impl JV {
         }
     }
 
+    /// Returns the underlying string if the value is a number.
     pub fn as_string(&self) -> Result<String> {
         unsafe {
             if jv_get_kind(self.ptr) == jv_kind_JV_KIND_STRING {
@@ -189,21 +270,30 @@ impl JV {
         }
     }
 
+    /// Returns whether the value is a valid, serializable value.
     pub fn is_valid(&self) -> bool {
         unsafe { jv_get_kind(self.ptr) != jv_kind_JV_KIND_INVALID }
     }
 
-    pub fn invalid_has_msg(&self) -> bool {
+    fn invalid_has_msg(&self) -> bool {
         unsafe { jv_invalid_has_msg(jv_copy(self.ptr)) == 1 }
     }
 
-    pub fn into_raw(self) -> jv {
+    pub(crate) fn into_raw(self) -> jv {
         let this = ManuallyDrop::new(self);
         this.ptr
     }
 }
 
-impl Drop for JV {
+impl Clone for Jv {
+    fn clone(&self) -> Self {
+        Jv {
+            ptr: unsafe { jv_copy(self.ptr) },
+        }
+    }
+}
+
+impl Drop for Jv {
     fn drop(&mut self) {
         unsafe { jv_free(self.ptr) };
     }
@@ -220,93 +310,75 @@ impl Parser {
         }
     }
 
-    pub fn parse(self, input: CString) -> Result<JV> {
-        // For a single run, we could set this to `1` (aka `true`) but this will
-        // break the repeated `JqProgram` usage.
-        // It may be worth exposing this to the caller so they can set it for each
-        // use case, but for now we'll just "leave it open."
-        let is_partial = 0;
+    pub fn parse_multi<'a>(
+        self,
+        inputs: impl Iterator<Item = &'a [u8]> + 'a,
+    ) -> impl Iterator<Item = Result<Jv>> + 'a {
+        let jq = self.ptr;
 
-        // Originally I planned to have a separate "set_buf" method, but it looks like
-        // the C api really wants you to set the buffer, then call `jv_parser_next()` in
-        // the same logical block.
-        // Mainly I think the important thing is to ensure the `input` outlives both the
-        // set_buf and next calls.
-        unsafe {
-            jv_parser_set_buf(
-                self.ptr,
-                input.as_ptr(),
-                input.as_bytes().len() as i32,
-                is_partial,
-            )
-        };
-
-        let value = JV {
-            ptr: unsafe { jv_parser_next(self.ptr) },
-        };
-        if value.is_valid() {
-            Ok(value)
-        } else {
-            Err(Error::System {
-                reason: Some(
-                    value
-                        .get_msg()
-                        .unwrap_or_else(|| "JQ: Parser error".to_string()),
-                ),
-            })
-        }
-    }
-
-    pub fn parse_slurped<Chunk>(
-        mut self,
-        inputs: impl Iterator<Item = Chunk>,
-        try_into_cstr: impl Fn(&Chunk) -> Result<&CStr>,
-    ) -> Result<JV> {
-        let mut slurped = JV {
-            ptr: unsafe { jv_array() },
-        };
-
-        let mut peekable = inputs.peekable();
-        while let Some(input) = peekable.next() {
-            // The early return will call the destructor of `slurped`, which drops the allocated array jv.
-            // The previous `input` stored under `self.ptr` is also freed whe `self` is dropped.
-            let input = try_into_cstr(&input)?;
-
-            unsafe {
-                jv_parser_set_buf(
-                    self.ptr,
-                    input.as_ptr(),
-                    input.to_bytes().len() as i32,
-                    if peekable.peek().is_some() { 1 } else { 0 },
-                );
-            }
-
-            while self.remaining() != 0 {
-                let value = JV {
-                    ptr: unsafe { jv_parser_next(self.ptr) },
-                };
-                if value.is_valid() {
-                    slurped.ptr = unsafe { jv_array_append(slurped.ptr, value.into_raw()) };
-                } else if unsafe { jv_invalid_has_msg(jv_copy(value.ptr)) } == 1 {
-                    // `self.ptr`, `slurped` and `value` will be independently dropped after this
-                    // return.
-                    return Err(Error::System {
-                        reason: Some(
-                            value
-                                .get_msg()
-                                .unwrap_or_else(|| "JQ: Parser error".to_string()),
-                        ),
-                    });
+        inputs
+            .with_position()
+            .flat_map(move |(pos, input)| {
+                unsafe {
+                    let is_partial = match pos {
+                        Position::First | Position::Middle => 1,
+                        Position::Only | Position::Last => 0,
+                    };
+                    jv_parser_set_buf(
+                        jq,
+                        input.as_ptr().cast::<i8>(),
+                        input.len() as i32,
+                        is_partial,
+                    );
                 }
+
+                iter::repeat(())
+                    .take_while(move |()| unsafe { jv_parser_remaining(jq) } != 0)
+                    .filter_map(move |()| {
+                        let value = Jv {
+                            ptr: unsafe { jv_parser_next(jq) },
+                        };
+
+                        if value.is_valid() {
+                            Some(Ok(value))
+                        } else if unsafe { jv_invalid_has_msg(jv_copy(value.ptr)) } != 0 {
+                            Some(Err(Error::System {
+                                reason: Some(
+                                    value
+                                        .get_msg()
+                                        .unwrap_or_else(|| "JQ: Parser error".to_string()),
+                                ),
+                            }))
+                        } else {
+                            None
+                        }
+                    })
+            })
+            .take_while_inclusive(|result| result.is_ok()) // fuse the iterator when an error is encountered to avoid working on invalid objects
+            .chain(empty_iter_with_finalizer(move || {
+                drop(self);
+            }))
+    }
+}
+
+fn empty_iter_with_finalizer<T, F: FnOnce()>(f: F) -> impl iter::FusedIterator<Item = T> {
+    struct Iter<T, F>(Option<F>, PhantomData<T>);
+
+    impl<T, F: FnOnce()> Iterator for Iter<T, F> {
+        type Item = T;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if let Some(f) = self.0.take() {
+                f();
             }
+
+            None
         }
-
-        Ok(slurped)
     }
 
-    fn remaining(&mut self) -> i32 {
-        unsafe { jv_parser_remaining(self.ptr) }
-    }
+    impl<T, F: FnOnce()> iter::FusedIterator for Iter<T, F> {}
+
+    Iter(Some(f), PhantomData)
 }
 
 impl Drop for Parser {
@@ -323,24 +395,7 @@ unsafe fn get_string_value(value: *const c_char) -> Result<String> {
     Ok(s.to_owned())
 }
 
-/// Renders the data from the parser and pushes it into the buffer.
-unsafe fn dump(jq: &Jq, buf: &mut String) -> Result<()> {
-    // Looks a lot like an iterator...
-
-    let mut value = JV {
-        ptr: jq_next(jq.state),
-    };
-
-    while value.is_valid() {
-        let s = value.as_dump_string()?;
-        buf.push_str(&s);
-        buf.push('\n');
-
-        value = JV {
-            ptr: jq_next(jq.state),
-        };
-    }
-
+unsafe fn report_jq_err(jq: &Jq, value: &Jv) -> Result<()> {
     if jq.is_halted() {
         use ExitCode::*;
         match jq.get_exit_code() {
@@ -361,10 +416,6 @@ unsafe fn dump(jq: &Jq, buf: &mut String) -> Result<()> {
             JQ_OK | JQ_OK_NULL_KIND | JQ_OK_NO_OUTPUT => Ok(()),
             JQ_ERROR_UNKNOWN => Err(Error::Unknown),
         }
-    } else if let Some(reason) = value.get_msg() {
-        Err(Error::System {
-            reason: Some(reason),
-        })
     } else {
         Ok(())
     }
